@@ -1,0 +1,258 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { motion } from 'framer-motion';
+import { Box, FileText } from 'lucide-react';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import ImageUploader from '../components/converter/ImageUploader';
+import SizeSlider from '../components/converter/SizeSlider.jsx';
+import BlockPreview from '../components/converter/BlockPreview';
+import ConvertButton from '../components/converter/ConvertButton';
+import OrientationToggle from '../components/converter/OrientationToggle';
+import FormatToggle from '../components/converter/FormatToggle';
+import BlockSelector from '../components/converter/BlockSelector';
+import PalettePresets from '../components/converter/PalettePresets';
+import ImageAdjustments from '../components/converter/ImageAdjustments';
+import ThreeDPreview from '../components/converter/ThreeDPreview';
+import { BLOCK_PALETTE } from '../lib/minecraft/blockColors';
+
+export default function Converter() {
+  const [imageInfo, setImageInfo] = useState(null);
+  const [targetWidth, setTargetWidth] = useState(128);
+  const [targetHeight, setTargetHeight] = useState(128);
+  const [thickness, setThickness] = useState(1);
+  const [previewUrl, setPreviewUrl] = useState(null);
+  const [isConverting, setIsConverting] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [orientation, setOrientation] = useState('vertical');
+  const [format, setFormat] = useState('litematic');
+  const [fileName, setFileName] = useState('');
+  const [allowedBlocks, setAllowedBlocks] = useState(() => new Set(BLOCK_PALETTE.map(b => b.name)));
+  const [adjustments, setAdjustments] = useState({ brightness: 0, contrast: 0, grayscale: false });
+  const [previewBlocks, setPreviewBlocks] = useState(null);
+  const previewTimeout = useRef(null);
+
+  // Precompute palette for fast lookup
+  const palette = useRef(BLOCK_PALETTE.map(b => [b.r, b.g, b.b]));
+  const paletteNames = useRef(BLOCK_PALETTE.map(b => b.name));
+
+  const handleImageLoad = useCallback((info) => {
+    setImageInfo(info);
+    const aspectRatio = info.height / info.width;
+    setTargetWidth(128);
+    setTargetHeight(Math.round(128 * aspectRatio));
+    const baseName = info.name?.replace(/\.[^.]+$/, '') || 'image';
+    setFileName(baseName);
+  }, []);
+
+  const handleClear = useCallback(() => {
+    setImageInfo(null);
+    setPreviewUrl(null);
+    setPreviewBlocks(null);
+    setTargetWidth(128);
+    setTargetHeight(128);
+    setThickness(1);
+    setFileName('');
+    setAdjustments({ brightness: 0, contrast: 0, grayscale: false });
+  }, []);
+
+  // Debounced preview
+  useEffect(() => {
+    if (!imageInfo) { setPreviewUrl(null); setPreviewBlocks(null); return; }
+    if (previewTimeout.current) clearTimeout(previewTimeout.current);
+    previewTimeout.current = setTimeout(() => {
+      const url = generatePreview(imageInfo.data, imageInfo.width, imageInfo.height, targetWidth, targetHeight, allowedBlocks, adjustments);
+      setPreviewUrl(url);
+      const pbData = generatePreviewBlocks(imageInfo.data, imageInfo.width, imageInfo.height, targetWidth, targetHeight, allowedBlocks, adjustments);
+      setPreviewBlocks(pbData);
+    }, 250);
+    return () => { if (previewTimeout.current) clearTimeout(previewTimeout.current); };
+  }, [imageInfo, targetWidth, targetHeight, allowedBlocks, adjustments]);
+
+  // Fast nearest block function
+  const nearestBlock = (r, g, b) => {
+    let bestIndex = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < palette.current.length; i++) {
+      const [pr, pg, pb] = palette.current[i];
+      const dr = r - pr;
+      const dg = g - pg;
+      const db = b - pb;
+      const dist = dr*dr + dg*dg + db*db;
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIndex = i;
+      }
+    }
+    return bestIndex;
+  };
+
+  // Convert image to schematic
+  const handleConvert = useCallback(async () => {
+    if (!imageInfo) return;
+
+    // Limit total blocks
+    const totalBlocks = targetWidth * targetHeight * thickness;
+    if (totalBlocks > 1000000) {
+      alert("Too many blocks! Reduce size or thickness.");
+      return;
+    }
+
+    setIsConverting(true);
+    setProgress(0);
+    await new Promise(r => setTimeout(r, 50));
+
+    // Resize & prepare typed arrays
+    const resized = resizeImageData(imageInfo.data, imageInfo.width, imageInfo.height, targetWidth, targetHeight, adjustments);
+    const pixels = new Float32Array(targetWidth * targetHeight * 3);
+    for (let i = 0; i < targetWidth*targetHeight; i++) {
+      const p = resized[i];
+      pixels[i*3] = p.r;
+      pixels[i*3+1] = p.g;
+      pixels[i*3+2] = p.b;
+    }
+
+    // Apply fast Floyd–Steinberg dithering
+    for (let y = 0; y < targetHeight; y++) {
+      for (let x = 0; x < targetWidth; x++) {
+        const idx = (y*targetWidth + x)*3;
+        const r = pixels[idx];
+        const g = pixels[idx+1];
+        const b = pixels[idx+2];
+
+        const blockIndex = nearestBlock(r,g,b);
+        const [pr, pg, pb] = palette.current[blockIndex];
+
+        const er = r - pr;
+        const eg = g - pg;
+        const eb = b - pb;
+
+        const spread = (dx, dy, factor) => {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx<0||nx>=targetWidth||ny<0||ny>=targetHeight) return;
+          const nidx = (ny*targetWidth + nx)*3;
+          pixels[nidx]   += er*factor;
+          pixels[nidx+1] += eg*factor;
+          pixels[nidx+2] += eb*factor;
+        };
+
+        spread(1,0,7/16);
+        spread(-1,1,3/16);
+        spread(0,1,5/16);
+        spread(1,1,1/16);
+      }
+      if(y % 10 === 0) setProgress(Math.floor((y/targetHeight)*100));
+      await new Promise(r=>setTimeout(r,0)); // yield thread
+    }
+
+    // Build schematic data (stub)
+    const schematic = buildSchematic(pixels, targetWidth, targetHeight, thickness, orientation, format, paletteNames.current);
+
+    // Download
+    const blob = new Blob([schematic], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const name = (fileName.trim() || 'image').replace(/[^a-zA-Z0-9_\-]/g, '_') || 'image';
+    a.download = `${name}.${format}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    setIsConverting(false);
+    setProgress(0);
+  }, [imageInfo, targetWidth, targetHeight, thickness, orientation, format, fileName, allowedBlocks, adjustments]);
+
+  return (
+    <div className="min-h-screen bg-background">
+      <div className="fixed inset-0 opacity-[0.03] pointer-events-none"
+        style={{
+          backgroundImage: 'linear-gradient(hsl(var(--foreground)) 1px, transparent 1px), linear-gradient(90deg, hsl(var(--foreground)) 1px, transparent 1px)',
+          backgroundSize: '24px 24px'
+        }}
+      />
+
+      <div className="relative z-10 max-w-2xl mx-auto px-4 py-8 sm:py-16">
+        <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="text-center mb-10">
+          <div className="inline-flex items-center gap-3 mb-4">
+            <div className="w-10 h-10 rounded-xl bg-primary/15 flex items-center justify-center">
+              <Box className="w-5 h-5 text-primary" />
+            </div>
+            <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-foreground">
+              Image <span className="text-primary">→</span> Schematic
+            </h1>
+          </div>
+          <p className="text-muted-foreground text-sm max-w-md mx-auto">
+            Convert any image into a Minecraft schematic file. Fast dithering and block mapping.
+          </p>
+        </motion.div>
+
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }} className="space-y-6">
+          <ImageUploader imagePreview={imageInfo?.preview} onImageLoad={handleImageLoad} onClear={handleClear} />
+
+          {imageInfo && (
+            <>
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex items-center justify-center gap-3 text-xs text-muted-foreground">
+                <span className="px-2 py-1 rounded-md bg-card border border-border font-mono">
+                  {imageInfo.width} × {imageInfo.height}px
+                </span>
+                <span className="text-border">→</span>
+                <span className="px-2 py-1 rounded-md bg-primary/10 border border-primary/20 text-primary font-mono font-medium">
+                  {targetWidth} × {targetHeight} × {thickness} blocks
+                </span>
+              </motion.div>
+
+              <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="rounded-2xl border border-border bg-card/50 p-6 space-y-6">
+                <SizeSlider width={targetWidth} height={targetHeight} thickness={thickness} onWidthChange={setTargetWidth} onHeightChange={setTargetHeight} onThicknessChange={setThickness} />
+                <div className="border-t border-border" />
+                <OrientationToggle value={orientation} onChange={setOrientation} />
+                <div className="border-t border-border" />
+                <FormatToggle value={format} onChange={setFormat} />
+                <div className="border-t border-border" />
+                <ImageAdjustments adjustments={adjustments} onChange={setAdjustments} />
+                <div className="border-t border-border" />
+                <BlockSelector allowedBlocks={allowedBlocks} onChange={setAllowedBlocks} />
+                <div className="border-t border-border" />
+                <PalettePresets allowedBlocks={allowedBlocks} onChange={setAllowedBlocks} />
+                <div className="border-t border-border" />
+                <div className="space-y-2">
+                  <Label className="flex items-center gap-2 text-sm font-medium text-foreground">
+                    <FileText className="w-4 h-4 text-primary" /> Output Filename
+                  </Label>
+                  <div className="flex items-center gap-2">
+                    <Input value={fileName} onChange={(e) => setFileName(e.target.value)} placeholder="my_schematic" className="font-mono bg-background border-border" />
+                    <span className="text-sm text-muted-foreground font-mono whitespace-nowrap">.{format}</span>
+                  </div>
+                </div>
+              </motion.div>
+
+              {previewUrl && <BlockPreview previewUrl={previewUrl} />}
+              {previewBlocks && <ThreeDPreview blocks={previewBlocks.blocks} width={previewBlocks.width} height={previewBlocks.height} thickness={thickness} orientation={orientation} />}
+
+              <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}>
+                <ConvertButton onConvert={handleConvert} isConverting={isConverting} progress={progress} disabled={!imageInfo} format={format} />
+              </motion.div>
+            </>
+          )}
+        </motion.div>
+
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4 }} className="mt-12 text-center text-xs text-muted-foreground/60">
+          <p>220+ Minecraft blocks · Fast dithering · Litematica v6 & Schematic · Runs in your browser</p>
+        </motion.div>
+      </div>
+    </div>
+  );
+}
+
+// Helper stubs: implement according to your app
+function resizeImageData(data, width, height, targetWidth, targetHeight, adjustments) {
+  // return resized & adjusted pixels as array of {r,g,b}
+  return new Array(targetWidth*targetHeight).fill({r:128,g:128,b:128}); // placeholder
+}
+function buildSchematic(pixels, width, height, thickness, orientation, format, blockNames) {
+  // return Uint8Array or ArrayBuffer for download
+  return new Uint8Array([0]); // placeholder
+}
+function generatePreview(){return null;}
+function generatePreviewBlocks(){return null;}
